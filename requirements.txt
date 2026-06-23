@@ -1,0 +1,4 @@
+streamlit>=1.41,<2
+python-docx>=1.1,<2
+lxml>=5,<7
+docxcompose>=1.4,<2

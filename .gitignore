@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+.streamlit/secrets.toml
+.qa/
+.pytest-tmp/
+

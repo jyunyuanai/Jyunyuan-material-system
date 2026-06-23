@@ -566,6 +566,10 @@ def _material_issues(records: list[MaterialRecord], document_name: str) -> list[
     return issues
 
 
+def _quality_result_placeholder_valid(value: str) -> bool:
+    return value in {"□合格□不合格", "□合格\n□不合格"}
+
+
 def _parse_quality_record(tables: list[etree._Element], document_name: str) -> tuple[list[MaterialRecord], list[ValidationIssue]]:
     rows = tables[0].findall("./w:tr", NS)
     records: list[MaterialRecord] = []
@@ -592,10 +596,11 @@ def _parse_quality_record(tables: list[etree._Element], document_name: str) -> t
             ))
             continue
         records.append(MaterialRecord(visible_text(cells[0]), row_index))
-        if visible_text(cells[4]) != "□合格□不合格":
+        result_placeholder = visible_text(cells[4])
+        if not _quality_result_placeholder_valid(result_placeholder):
             issues.append(ValidationIssue(
                 "result_placeholder", "抽驗結果格式已變動", document_name,
-                1, row_index, "抽驗結果", "□合格□不合格", visible_text(cells[4]),
+                1, row_index, "抽驗結果", "□合格□不合格 或 □合格\\n□不合格", result_placeholder,
             ))
     return records, issues
 
@@ -1390,7 +1395,6 @@ def render_word_import(settings: AppSettings) -> tuple[str, ...]:
                 "imported_sources",
                 "generated_docx",
                 "generated_fingerprint",
-                "planned_submission_month",
             ):
                 st.session_state.pop(key, None)
             for key in list(st.session_state):
@@ -1438,15 +1442,6 @@ def selected_material_names(materials: tuple[str, ...], slot_count: int) -> list
         for index in range(slot_count)
         if (value := st.session_state.get(f"material_slot_{index}")) in materials
     ]
-
-
-def material_sort_key(name: str) -> tuple[tuple[int, int | str], ...]:
-    parts = re.split(r"(\d+)", name.casefold())
-    return tuple(
-        (0, int(part)) if part.isdigit() else (1, part)
-        for part in parts
-        if part
-    )
 
 
 def add_material_slot() -> None:
@@ -1532,10 +1527,10 @@ def render_material_form(materials: tuple[str, ...]) -> None:
         st.caption(
             f"已擷取 {len(materials)} 項可選材料；選單依序編號，目前顯示 {slot_count} 個材料欄位。"
         )
-        sorted_materials = sorted(materials, key=material_sort_key)
+        ordered_materials = list(materials)
         material_labels = {
             name: f"{position}.{name}"
-            for position, name in enumerate(sorted_materials, start=1)
+            for position, name in enumerate(ordered_materials, start=1)
         }
         current_selected = selected_material_names(materials, slot_count)
         for index in range(slot_count):
@@ -1544,7 +1539,7 @@ def render_material_form(materials: tuple[str, ...]) -> None:
             unavailable = set(current_selected)
             if current:
                 unavailable.discard(current)
-            options = [""] + [name for name in sorted_materials if name not in unavailable]
+            options = [""] + [name for name in ordered_materials if name not in unavailable]
             columns = st.columns([2.4, 1.05, 1.05])
             with columns[0]:
                 selected_name = st.selectbox(
@@ -1620,11 +1615,10 @@ def render_material_form(materials: tuple[str, ...]) -> None:
         project_name = st.session_state.get("project_name", "").strip()
         fingerprint = generation_fingerprint(project_name, chosen)
         if st.session_state.get("generated_docx") and st.session_state.get("generated_fingerprint") == fingerprint:
-            safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", project_name).strip(" .")
             st.download_button(
                 "下載四表 Word",
                 data=st.session_state["generated_docx"],
-                file_name=f"{safe_name or '工程材料'}_四表.docx",
+                file_name=f"{APP_NAME}.docx",
                 mime=DOCX_MIME,
                 use_container_width=True,
                 on_click="ignore",

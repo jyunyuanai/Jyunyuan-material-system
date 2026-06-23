@@ -1,12 +1,8 @@
 from __future__ import annotations
 
-import base64
-import getpass
 import hashlib
 import hmac
 import re
-import secrets
-import sys
 import time
 from copy import deepcopy
 from dataclasses import dataclass
@@ -42,11 +38,6 @@ MAX_UNCOMPRESSED_BYTES = 100 * 1024 * 1024
 PROHIBITED_PART_PREFIXES = ("word/embeddings/", "word/activeX/")
 PROHIBITED_PART_NAMES = {"word/vbaProject.bin"}
 
-SCRYPT_N = 2**14
-SCRYPT_R = 8
-SCRYPT_P = 1
-SCRYPT_DKLEN = 32
-
 
 class DocumentKind(StrEnum):
     QUALITY_RECORD = "工程材料／設備品質抽驗紀錄表"
@@ -65,7 +56,7 @@ OUTPUT_ORDER = (
 
 @dataclass(frozen=True, slots=True)
 class AppSettings:
-    password_hash: str
+    password: str
     allow_unsecured_local: bool
 
 
@@ -155,47 +146,10 @@ class FourFormGenerationError(ValueError):
 # 密碼與 Secrets
 # =============================================================================
 
-def _derive_password(password: str, salt: bytes, *, n: int, r: int, p: int) -> bytes:
-    return hashlib.scrypt(
-        password.encode("utf-8"),
-        salt=salt,
-        n=n,
-        r=r,
-        p=p,
-        dklen=SCRYPT_DKLEN,
-    )
-
-
-def hash_password(password: str) -> str:
-    if not password:
-        raise ValueError("密碼不可為空")
-    salt = secrets.token_bytes(16)
-    derived = _derive_password(password, salt, n=SCRYPT_N, r=SCRYPT_R, p=SCRYPT_P)
-    salt_text = base64.urlsafe_b64encode(salt).decode("ascii").rstrip("=")
-    hash_text = base64.urlsafe_b64encode(derived).decode("ascii").rstrip("=")
-    return f"$scrypt$n={SCRYPT_N},r={SCRYPT_R},p={SCRYPT_P}${salt_text}${hash_text}"
-
-
-def _decode_base64(value: str) -> bytes:
-    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
-
-
-def verify_password(password: str, encoded_hash: str) -> bool:
-    if not password or not encoded_hash:
+def verify_password(password: str, expected_password: str) -> bool:
+    if not password or not expected_password:
         return False
-    try:
-        marker, algorithm, params, salt_text, expected_text = encoded_hash.split("$")
-        if marker or algorithm != "scrypt":
-            return False
-        parsed = dict(item.split("=", 1) for item in params.split(","))
-        n, r, p = int(parsed["n"]), int(parsed["r"]), int(parsed["p"])
-        if (n, r, p) != (SCRYPT_N, SCRYPT_R, SCRYPT_P):
-            return False
-        actual = _derive_password(password, _decode_base64(salt_text), n=n, r=r, p=p)
-        expected = _decode_base64(expected_text)
-    except (ValueError, KeyError):
-        return False
-    return hmac.compare_digest(actual, expected)
+    return hmac.compare_digest(password, expected_password)
 
 
 def _secret_section(values: Mapping[str, Any], name: str) -> Mapping[str, Any]:
@@ -206,7 +160,7 @@ def _secret_section(values: Mapping[str, Any], name: str) -> Mapping[str, Any]:
 def load_settings(values: Mapping[str, Any]) -> AppSettings:
     app = _secret_section(values, "app")
     return AppSettings(
-        password_hash=str(app.get("password_hash", "")),
+        password=str(app.get("password", "")),
         allow_unsecured_local=app.get("allow_unsecured_local") is True,
     )
 
@@ -1339,14 +1293,14 @@ def require_login(settings: AppSettings) -> bool:
                 st.session_state.clear()
                 st.rerun()
         return True
-    has_password = bool(settings.password_hash and "REPLACE_WITH" not in settings.password_hash)
+    has_password = bool(settings.password)
     if not has_password and settings.allow_unsecured_local:
         return True
     st.title(APP_NAME)
     if not has_password:
         st.error("尚未設定登入密碼。")
         st.markdown("本機請修改 `.streamlit/secrets.toml`；Streamlit Cloud 請修改 App Settings → Secrets。")
-        st.code(r".\.venv\Scripts\python.exe streamlit_app.py --hash-password", language="powershell")
+        st.code('[app]\npassword = "1234"\nallow_unsecured_local = false', language="toml")
         return False
     failures = int(st.session_state.get("login_failures", 0))
     remaining = max(0, int(float(st.session_state.get("login_blocked_until", 0.0)) - time.monotonic()))
@@ -1357,7 +1311,7 @@ def require_login(settings: AppSettings) -> bool:
         password = st.text_input("共用密碼", type="password", autocomplete="current-password")
         submitted = st.form_submit_button("登入", use_container_width=True, type="primary")
     if submitted:
-        if verify_password(password, settings.password_hash):
+        if verify_password(password, settings.password):
             st.session_state["authenticated"] = True
             st.session_state["login_failures"] = 0
             st.rerun()
@@ -1431,7 +1385,7 @@ def render_word_import(settings: AppSettings) -> tuple[str, ...]:
                 st.session_state["material_slot_count"] = 8
                 st.success(f"四份 Word 已讀取，共 {len(submission.materials)} 項材料。")
                 st.caption("材料選單依材料設備送審管制總表的原始順序顯示，本次資料不會永久保存。")
-        if settings.allow_unsecured_local and not settings.password_hash:
+        if settings.allow_unsecured_local and not settings.password:
             st.caption("本機開發模式")
     return tuple(st.session_state.get("imported_materials", ()))
 
@@ -1635,16 +1589,5 @@ def main() -> None:
     render_material_form(materials)
 
 
-def create_password_hash_from_terminal() -> None:
-    first = getpass.getpass("請輸入新密碼：")
-    second = getpass.getpass("請再次輸入新密碼：")
-    if first != second:
-        raise SystemExit("兩次密碼不一致。")
-    print(hash_password(first))
-
-
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "--hash-password":
-        create_password_hash_from_terminal()
-    else:
-        main()
+    main()

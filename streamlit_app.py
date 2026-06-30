@@ -26,6 +26,7 @@ APP_NAME = "監造計畫書材料系統"
 MAX_LOGIN_FAILURES = 5
 LOGIN_COOLDOWN_SECONDS = 30
 DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+OUTPUT_FONT_NAME = "標楷體"
 
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 W = f"{{{W_NS}}}"
@@ -540,6 +541,7 @@ def _parse_quality_record(tables: list[etree._Element], document_name: str) -> t
                 "quality_record_footer", "尾端處理方式或特殊紀錄列格式不正確", document_name,
                 1, row_index, expected="5:-", actual=row_shape(row),
             ))
+    blank_started = False
     for row_index, row in enumerate(rows[3:-2], start=4):
         cells = row.findall("./w:tc", NS)
         shape = row_shape(row)
@@ -549,7 +551,16 @@ def _parse_quality_record(tables: list[etree._Element], document_name: str) -> t
                 1, row_index, expected="1:-|1:-|1:-|1:-|1:-", actual=shape,
             ))
             continue
-        records.append(MaterialRecord(visible_text(cells[0]), row_index))
+        name = visible_text(cells[0])
+        if not name:
+            blank_started = True
+            continue
+        if blank_started:
+            issues.append(ValidationIssue(
+                "material_after_blank", "空白預留列後不可再出現材料", document_name,
+                1, row_index, "材料名稱", actual=name,
+            ))
+        records.append(MaterialRecord(name, row_index))
         result_placeholder = visible_text(cells[4])
         if not _quality_result_placeholder_valid(result_placeholder):
             issues.append(ValidationIssue(
@@ -597,13 +608,14 @@ def _parse_quality_standard(tables: list[etree._Element], document_name: str) ->
     records: list[MaterialRecord] = []
     issues: list[ValidationIssue] = []
     index = 1
+    blank_started = False
     while index < len(rows):
         row = rows[index]
         shape = row_shape(row)
-        cells = row.findall("./w:tc", NS)
         source_row = index + 1
         if shape == "2:-|1:-|1:-":
-            records.append(MaterialRecord(_quality_standard_record_name(row), source_row, 1))
+            name = _quality_standard_record_name(row)
+            count = 1
             index += 1
         elif shape == "1:restart|1:-|1:-|1:-":
             name = _quality_standard_record_name(row)
@@ -612,38 +624,61 @@ def _parse_quality_standard(tables: list[etree._Element], document_name: str) ->
             while index < len(rows) and row_shape(rows[index]) == "1:continue|1:-|1:-|1:-":
                 count += 1
                 index += 1
-            records.append(MaterialRecord(name, source_row, count))
         else:
             issues.append(ValidationIssue(
                 "quality_standard_shape", "材料列合併結構不正確", document_name,
                 1, source_row, expected="正式單列或多列格式", actual=shape,
             ))
             index += 1
+            continue
+        if not name:
+            blank_started = True
+            continue
+        if blank_started:
+            issues.append(ValidationIssue(
+                "material_after_blank", "空白預留列後不可再出現材料", document_name,
+                1, source_row, "材料名稱", actual=name,
+            ))
+        records.append(MaterialRecord(name, source_row, count))
     return records, issues
+
+
+def _iter_material_pairs(
+    rows: list[etree._Element],
+    top_shape: str,
+    bottom_shape: str,
+    document_name: str,
+    pair_code: str,
+) -> tuple[list[tuple[int, etree._Element, etree._Element]], list[ValidationIssue]]:
+    """檢查「每項材料兩列一組」的結構，回傳合格的 (offset, top, bottom) 與所有問題。"""
+    issues: list[ValidationIssue] = []
+    if (len(rows) - 4) % 2:
+        issues.append(ValidationIssue(
+            f"{pair_code}_row_pairs", "材料資料列必須是每項材料兩列一組", document_name,
+            1, expected="表頭後偶數列", actual=str(len(rows) - 4),
+        ))
+    pairs: list[tuple[int, etree._Element, etree._Element]] = []
+    for offset in range(4, len(rows) - 1, 2):
+        top, bottom = rows[offset], rows[offset + 1]
+        if row_shape(top) != top_shape or row_shape(bottom) != bottom_shape:
+            issues.append(ValidationIssue(
+                f"{pair_code}_pair", "材料雙列合併結構不正確", document_name,
+                1, offset + 1,
+            ))
+            continue
+        pairs.append((offset, top, bottom))
+    return pairs, issues
 
 
 def _parse_submission(tables: list[etree._Element], document_name: str) -> tuple[list[MaterialRecord], list[ValidationIssue]]:
     rows = tables[0].findall("./w:tr", NS)
     records: list[MaterialRecord] = []
-    issues: list[ValidationIssue] = []
     top_shape = "1:restart|1:-|1:restart|1:restart|1:-|1:-|1:-|1:restart|1:restart|2:restart|1:restart|1:restart|1:-|1:restart"
     bottom_shape = "1:continue|1:-|1:continue|1:continue|1:-|1:-|1:-|1:continue|1:continue|2:continue|1:continue|1:continue|1:-|1:continue"
+    pairs, issues = _iter_material_pairs(rows, top_shape, bottom_shape, document_name, "submission")
     blank_started = False
-    if (len(rows) - 4) % 2:
-        issues.append(ValidationIssue(
-            "submission_row_pairs", "材料資料列必須是每項材料兩列一組", document_name,
-            1, expected="表頭後偶數列", actual=str(len(rows) - 4),
-        ))
-    for offset in range(4, len(rows) - 1, 2):
-        top, bottom = rows[offset], rows[offset + 1]
-        if row_shape(top) != top_shape or row_shape(bottom) != bottom_shape:
-            issues.append(ValidationIssue(
-                "submission_pair", "材料雙列合併結構不正確", document_name,
-                1, offset + 1,
-            ))
-            continue
-        cells = bottom.findall("./w:tc", NS)
-        name = visible_text(cells[1])
+    for offset, _top, bottom in pairs:
+        name = visible_text(bottom.findall("./w:tc", NS)[1])
         if not name:
             blank_started = True
             continue
@@ -659,23 +694,20 @@ def _parse_submission(tables: list[etree._Element], document_name: str) -> tuple
 def _parse_inspection(tables: list[etree._Element], document_name: str) -> tuple[list[MaterialRecord], list[ValidationIssue]]:
     rows = tables[0].findall("./w:tr", NS)
     records: list[MaterialRecord] = []
-    issues: list[ValidationIssue] = []
     top_shape = "1:restart|1:-|1:-|1:restart|1:-|1:restart|1:restart|2:restart|1:restart|1:restart"
     bottom_shape = "1:continue|1:-|1:-|1:continue|1:-|1:continue|1:continue|2:continue|1:continue|1:continue"
-    if (len(rows) - 4) % 2:
-        issues.append(ValidationIssue(
-            "inspection_row_pairs", "材料資料列必須是每項材料兩列一組", document_name,
-            1, expected="表頭後偶數列", actual=str(len(rows) - 4),
-        ))
-    for offset in range(4, len(rows) - 1, 2):
-        top, bottom = rows[offset], rows[offset + 1]
-        if row_shape(top) != top_shape or row_shape(bottom) != bottom_shape:
-            issues.append(ValidationIssue(
-                "inspection_pair", "材料雙列合併結構不正確", document_name,
-                1, offset + 1,
-            ))
-            continue
+    pairs, issues = _iter_material_pairs(rows, top_shape, bottom_shape, document_name, "inspection")
+    blank_started = False
+    for offset, _top, bottom in pairs:
         name = visible_text(bottom.findall("./w:tc", NS)[1])
+        if not name:
+            blank_started = True
+            continue
+        if blank_started:
+            issues.append(ValidationIssue(
+                "material_after_blank", "空白預留列後不可再出現材料", document_name,
+                1, offset + 2, "材料名稱", actual=name,
+            ))
         records.append(MaterialRecord(name, offset + 2))
     return records, issues
 
@@ -814,23 +846,16 @@ def _set_cell_text(cell: etree._Element, value: str, *, alignment: str | None = 
         text.text = line
 
 
-def _source_default_run_format(entries: dict[str, bytes]) -> tuple[dict[str, str], str | None]:
+def _source_default_run_size(entries: dict[str, bytes]) -> str | None:
     styles_content = entries.get("word/styles.xml")
     if not styles_content:
-        return {}, None
+        return None
     styles = etree.fromstring(styles_content)
     run_properties = styles.find("./w:docDefaults/w:rPrDefault/w:rPr", NS)
     if run_properties is None:
-        return {}, None
-    fonts = run_properties.find("./w:rFonts", NS)
-    font_values: dict[str, str] = {}
-    if fonts is not None:
-        for key in ("ascii", "hAnsi", "eastAsia", "cs"):
-            value = fonts.get(W + key)
-            if value:
-                font_values[key] = value
+        return None
     size = run_properties.find("./w:sz", NS)
-    return font_values, size.get(W + "val") if size is not None else None
+    return size.get(W + "val") if size is not None else None
 
 
 def _ensure_run_properties(run: etree._Element) -> etree._Element:
@@ -842,35 +867,28 @@ def _ensure_run_properties(run: etree._Element) -> etree._Element:
 
 
 def _materialize_source_run_defaults(entries: dict[str, bytes], document: etree._Element) -> None:
-    default_fonts, default_size = _source_default_run_format(entries)
     # Some official forms rely on Word's implicit 11pt default instead of writing
     # w:sz into styles.xml. Materializing it prevents later merged sections from
     # inheriting the first document's default size.
-    if default_fonts and default_size is None:
-        default_size = "22"
-    if not default_fonts and not default_size:
-        return
+    default_size = _source_default_run_size(entries) or "22"
     for run in document.findall(".//w:r", NS):
         if run.find("./w:t", NS) is None:
             continue
         run_properties = _ensure_run_properties(run)
-        if default_fonts:
-            fonts = run_properties.find("./w:rFonts", NS)
-            if fonts is None:
-                fonts = etree.Element(W + "rFonts")
-                run_properties.insert(0, fonts)
-            for key, value in default_fonts.items():
-                if fonts.get(W + key) is None:
-                    fonts.set(W + key, value)
-        if default_size:
-            if run_properties.find("./w:sz", NS) is None:
-                size = etree.Element(W + "sz")
-                size.set(W + "val", default_size)
-                run_properties.append(size)
-            if run_properties.find("./w:szCs", NS) is None:
-                size_cs = etree.Element(W + "szCs")
-                size_cs.set(W + "val", default_size)
-                run_properties.append(size_cs)
+        fonts = run_properties.find("./w:rFonts", NS)
+        if fonts is None:
+            fonts = etree.Element(W + "rFonts")
+            run_properties.insert(0, fonts)
+        for key in ("ascii", "hAnsi", "eastAsia", "cs"):
+            fonts.set(W + key, OUTPUT_FONT_NAME)
+        if run_properties.find("./w:sz", NS) is None:
+            size = etree.Element(W + "sz")
+            size.set(W + "val", default_size)
+            run_properties.append(size)
+        if run_properties.find("./w:szCs", NS) is None:
+            size_cs = etree.Element(W + "szCs")
+            size_cs.set(W + "val", default_size)
+            run_properties.append(size_cs)
 
 
 def _serialize_package(
@@ -915,6 +933,21 @@ def _replace_rows(table: etree._Element, rows: list[etree._Element]) -> None:
         table.append(deepcopy(row))
 
 
+def _clear_cells(cells: list[etree._Element], indices: tuple[int, ...]) -> None:
+    for index in indices:
+        _set_cell_text(cells[index], "")
+
+
+def _clone_material_pair(
+    rows: list[etree._Element],
+    index: int,
+) -> tuple[etree._Element, etree._Element, list[etree._Element], list[etree._Element]]:
+    """複製某項材料的上下兩列，並回傳兩列與其儲存格清單。"""
+    top = deepcopy(rows[4 + 2 * index])
+    bottom = deepcopy(rows[5 + 2 * index])
+    return top, bottom, top.findall("./w:tc", NS), bottom.findall("./w:tc", NS)
+
+
 def _filter_quality_record(
     entries: dict[str, bytes],
     document: etree._Element,
@@ -930,7 +963,7 @@ def _filter_quality_record(
         row = deepcopy(rows[3 + index])
         cells = row.findall("./w:tc", NS)
         _set_cell_text(cells[3], "")
-        _set_cell_text(cells[4], "□合格□不合格")
+        _set_cell_text(cells[4], "□合格\n□不合格")
         selected.append(row)
     _replace_rows(tables[0], header + selected + [deepcopy(row) for row in rows[-2:]])
     return _serialize_package(entries, document, materialize_run_defaults=True)
@@ -971,18 +1004,13 @@ def _filter_submission(
     _set_cell_text(header_cells[1], "表單編號：")
     output_rows = header
     for sequence, selection in enumerate(selections, start=1):
-        top = deepcopy(rows[4 + 2 * selection.index])
-        bottom = deepcopy(rows[5 + 2 * selection.index])
-        top_cells = top.findall("./w:tc", NS)
-        bottom_cells = bottom.findall("./w:tc", NS)
+        top, bottom, top_cells, bottom_cells = _clone_material_pair(rows, selection.index)
         _set_cell_text(top_cells[0], f"{sequence}.")
         _set_cell_text(top_cells[1], selection.contract_item)
         _set_cell_text(top_cells[2], selection.contract_quantity)
         _set_cell_text(top_cells[4], selection.planned_submission_date)
-        for cell_index in (12, 13):
-            _set_cell_text(top_cells[cell_index], "")
-        for cell_index in (4, 5, 12, 13):
-            _set_cell_text(bottom_cells[cell_index], "")
+        _clear_cells(top_cells, (12, 13))
+        _clear_cells(bottom_cells, (4, 5, 12, 13))
         output_rows.extend((top, bottom))
     _replace_rows(table, output_rows)
     return _serialize_package(entries, document, materialize_run_defaults=True)
@@ -1007,18 +1035,13 @@ def _filter_inspection(
     _set_cell_text(second[1], "")
     output_rows = header
     for sequence, selection in enumerate(selections, start=1):
-        top = deepcopy(rows[4 + 2 * selection.index])
-        bottom = deepcopy(rows[5 + 2 * selection.index])
-        top_cells = top.findall("./w:tc", NS)
-        bottom_cells = bottom.findall("./w:tc", NS)
+        top, bottom, top_cells, bottom_cells = _clone_material_pair(rows, selection.index)
         _set_cell_text(top_cells[0], f"{sequence}.")
         _set_cell_text(top_cells[1], selection.contract_item, alignment="center")
         _set_cell_text(top_cells[2], selection.planned_submission_date)
         _set_cell_text(top_cells[3], selection.contract_quantity, alignment="center")
-        for cell_index in (4, 6, 7, 8, 9):
-            _set_cell_text(top_cells[cell_index], "")
-        for cell_index in (0, 2, 3, 4, 5, 6, 7, 8, 9):
-            _set_cell_text(bottom_cells[cell_index], "")
+        _clear_cells(top_cells, (4, 6, 7, 8, 9))
+        _clear_cells(bottom_cells, (0, 2, 3, 4, 5, 6, 7, 8, 9))
         output_rows.extend((top, bottom))
     _replace_rows(table, output_rows)
     return _serialize_package(entries, document, materialize_run_defaults=True)
@@ -1504,8 +1527,10 @@ def render_material_form(materials: tuple[str, ...]) -> None:
                 )
             identity_key = f"material_slot_identity_{index}"
             if selected_name != st.session_state.get(identity_key):
-                for field in ("contract_item", "contract_quantity"):
-                    st.session_state.pop(f"{field}_{index}", None)
+                st.session_state.pop(f"contract_quantity_{index}", None)
+                st.session_state[f"contract_item_{index}"] = (
+                    "壹、一、(一)、" if selected_name else ""
+                )
                 st.session_state[identity_key] = selected_name
             with columns[1]:
                 st.text_input(
